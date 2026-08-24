@@ -25,11 +25,13 @@ import {
 } from 'lucide-react';
 import { AIM_OUTPUT_POLICY, AIM_REFERENCE_ROLE, createPerformancePlan, encodeWav, extractFeatures, seededRandom } from './audio';
 import type { LearnedFeatures as AudioLearnedFeatures } from './audio';
-import { createLyricTimeline, createRadioArrangement, emptyMusicianMix, toLrc, validateSongInput } from './song';
-import type { ArrangementSection, LyricCue, MusicianMix, SongInput } from './song';
+import { createLyricTimeline, createRadioArrangement, defaultDrumKitSettings, emptyMusicianMix, toLrc, validateSongInput } from './song';
+import type { ArrangementSection, DrumKitSettings, LyricCue, MusicianMix, SongInput } from './song';
 import { createZip } from './archive';
-import { rankReferenceLayers } from './sample-curation';
+import { rankDrumReferenceLayers, rankReferenceLayers } from './sample-curation';
 import { deriveSampleAdjustedControls, profileDefaultControls, shouldApplySampleAdjustment } from './sample-adjustment';
+import { discoverDrumFiles, discoverSampleFiles, sampleInstrumentOrder } from './sample-folder';
+import type { SampleInstrumentId } from './sample-folder';
 import { getVerifiedAimDownload, parseAimFile } from './aimf';
 import type { AimLayer, ParsedAim } from './aimf';
 
@@ -86,6 +88,15 @@ type InstrumentId =
 
 type LearnedFeatures = AudioLearnedFeatures;
 type Asset = { name: string; bytes: Uint8Array; url: string; size: string; features?: LearnedFeatures; sourcePath?: string; score?: number; selected?: boolean; objectPath?: string };
+type SampleScanStatus = 'idle' | 'scanning' | 'complete' | 'error';
+type SampleScanSummary = {
+  rootName: string | null;
+  discovered: number;
+  analyzed: number;
+  skipped: number;
+  unreadable: number;
+  grouped: Record<InstrumentId, number>;
+};
 type Profile = {
   title: string;
   eyebrow: string;
@@ -97,7 +108,7 @@ type Profile = {
 type StudioRender = {
   duration: number;
   master: { url: string; bytes: Uint8Array };
-  stems: Partial<Record<InstrumentId, { url: string; bytes: Uint8Array }>>;
+  stems: Partial<Record<StudioInstrumentId, { url: string; bytes: Uint8Array }>>;
 };
 type GenerationInstrument = {
   bytes?: Uint8Array;
@@ -110,7 +121,7 @@ type GenerationInstrument = {
   sdkObjectPath?: string;
 };
 
-type SavedRender = { id: string; savedAt: string; duration: number; masterObjectPath: string; stems: Partial<Record<InstrumentId, string>> };
+type SavedRender = { id: string; savedAt: string; duration: number; masterObjectPath: string; stems: Partial<Record<StudioInstrumentId, string>> };
 type CommerceAccess = {
   studioActive: boolean;
   entitlements: { instruments: InstrumentId[]; sdks: InstrumentId[]; commercialSdk: boolean };
@@ -126,6 +137,9 @@ type CommerceProduct = {
   instrumentId: InstrumentId | null;
   prices: Array<{ id: string; amount: number | null; currency: string; interval: 'month' | 'year' | null; intervalCount: number | null }>;
 };
+type StudioInstrumentId = InstrumentId | 'drums';
+type DrumScanStatus = 'idle' | 'scanning' | 'complete';
+type DrumScanSummary = { rootName: string | null; discovered: number; analyzed: number; skipped: number; unreadable: number };
 const profiles: Record<InstrumentId, Profile> = {
   'acoustic-guitar': {
     title: 'Acoustic guitar',
@@ -221,6 +235,8 @@ const profiles: Record<InstrumentId, Profile> = {
 };
 
 const order = Object.keys(profiles) as InstrumentId[];
+const studioOrder: StudioInstrumentId[] = [...order, 'drums'];
+const instrumentTitle = (instrument: StudioInstrumentId) => instrument === 'drums' ? 'Country drums' : profiles[instrument].title;
 type ControlBank = Record<InstrumentId, Record<string, number>>;
 type ControlMode = 'defaults' | 'auto' | 'manual';
 const controlDefinitions = (instrument: InstrumentId) => profiles[instrument].controls.map((control) => ({
@@ -257,6 +273,24 @@ const midi2Maps: Record<InstrumentId, { group: number; noteRange: [number, numbe
   fiddle: { group: 5, noteRange: [55, 96], perNoteControllers: { 'registered-controllers.1': 'bow-pressure', 'registered-controllers.2': 'vibrato', 'registered-controllers.3': 'bowing-grain', 'registered-controllers.4': 'portamento' } },
   keyboard: { group: 6, noteRange: [21, 108], perNoteControllers: { 'registered-controllers.1': 'key-velocity', 'registered-controllers.2': 'hammer-tone', 'registered-controllers.3': 'pedal-tail', 'registered-controllers.4': 'stereo-field' } },
   vocal: { group: 7, noteRange: [48, 84], perNoteControllers: { 'registered-controllers.1': 'breath-texture', 'registered-controllers.2': 'vowel-focus', 'registered-controllers.3': 'consonant-edge', 'registered-controllers.4': 'room-presence' } },
+};
+const drumMidi2 = {
+  protocol: 'MIDI 2.0 UMP',
+  version: '1.0',
+  group: 8,
+  noteRange: [35, 59] as [number, number],
+  defaultTuning: '12-TET A4=440Hz',
+  velocity: 'MIDI 2.0 note velocity 32-bit normalized to 0..1',
+  pitch: 'MIDI 2.0 per-note pitch 32-bit',
+  loudness: 'MIDI 2.0 per-note loudness 32-bit',
+  noteAttribute: 'country-drum articulation',
+  perNoteControllers: {
+    'registered-controllers.1': 'swing',
+    'registered-controllers.2': 'fills',
+    'registered-controllers.3': 'kick-tightness',
+    'registered-controllers.4': 'hat-openness',
+  },
+  compatibility: 'MIDI 1.0 fallback allowed; MIDI 2.0 is canonical',
 };
 
 type LiveVoice = { oscillators: OscillatorNode[]; gain: GainNode };
@@ -337,6 +371,80 @@ class LiveEngine {
 
 function formatBytes(bytes: number) {
   return `${(bytes / 1024 / 1024).toFixed(bytes > 1_000_000 ? 1 : 2)} MB`;
+}
+
+function buildDrumAimFile(assets: Asset[], settings: DrumKitSettings) {
+  const metadata = {
+    format: 'AIM',
+    version: 1,
+    specification: { name: 'AIMF', version: '0.1', byteOrder: 'little-endian', hostRequirement: 'AIM-compatible procedural runtime', portability: 'host-neutral metadata; render contract is deterministic across compliant hosts' },
+    createdAt: new Date().toISOString(),
+    instrument: 'drums',
+    engine: {
+      mode: 'procedural-instrument',
+      runtimeId: 'aim.drums.procedural.v1',
+      runtimeVersion: '1.0.0',
+      samplePolicy: AIM_REFERENCE_ROLE,
+      outputPolicy: AIM_OUTPUT_POLICY,
+      synthesis: 'country-drum-kit',
+      architecture: 'procedural kick, snare, hat, brush, and fill model',
+      renderContract: { input: 'MIDI 2.0 UMP note and per-note expression events', output: 'linear PCM audio', sampleRate: 44100, channels: 1, deterministic: true, sourcePlayback: false },
+    },
+    midi2: drumMidi2,
+    synth: {
+      title: 'Country drums',
+      eyebrow: 'Percussion / country',
+      color: '#c89454',
+      description: 'A steady country backbeat with adjustable swing, fills, kick tightness, and hat openness.',
+      architecture: 'Procedural country drum kit',
+      specVersion: 'AIM-SYNTH 1.0',
+      signalGraph: { voiceAllocation: 'polyphonic-percussion', excitation: 'synthesized-transient-noise', kick: 'pitched-sine-sweep', snare: 'filtered-noise', hats: 'highpass-noise', controls: settings },
+    },
+    model: { version: 1, training: 'deterministic-feature-conditioning', controls: settings, learnedFeatures: assets.map((asset) => ({ name: asset.name, ...asset.features })) },
+    assets: assets.map((asset) => ({ name: asset.name, type: 'audio/ogg', role: AIM_REFERENCE_ROLE, bytes: asset.bytes.length })),
+  };
+  const json = new TextEncoder().encode(JSON.stringify(metadata));
+  const header = new ArrayBuffer(12);
+  const view = new DataView(header);
+  new Uint8Array(header, 0, 4).set([0x41, 0x49, 0x4d, 0x46]);
+  view.setUint16(4, 1, true);
+  view.setUint32(6, json.length, true);
+  view.setUint16(10, assets.length, true);
+  const chunks: Uint8Array[] = [new Uint8Array(header), json];
+  assets.forEach((asset) => {
+    const name = new TextEncoder().encode(asset.name);
+    const entry = new ArrayBuffer(6);
+    const entryView = new DataView(entry);
+    entryView.setUint16(0, name.length, true);
+    entryView.setUint32(2, asset.bytes.length, true);
+    chunks.push(new Uint8Array(entry), name, asset.bytes);
+  });
+  const result = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.length, 0));
+  let offset = 0;
+  chunks.forEach((chunk) => { result.set(chunk, offset); offset += chunk.length; });
+  return result;
+}
+
+function buildDrumSdkPackage(aimBytes: Uint8Array) {
+  const sdkName = 'drums-sdk';
+  const encoder = new TextEncoder();
+  const manifest = {
+    format: 'AIM Instrument SDK',
+    version: '0.1',
+    instrument: 'drums',
+    aimPackage: 'drums.aim',
+    runtime: { id: 'aim.drums.procedural.v1', version: '1.0.0', output: 'linear PCM audio', sourcePlayback: false, requiredHost: 'AIM-compatible procedural runtime' },
+    midi2: drumMidi2,
+    files: [`${sdkName}/manifest.json`, `${sdkName}/synth-profile.json`, `${sdkName}/midi2.json`, `${sdkName}/runtime-contract.json`, `${sdkName}/drums.aim`],
+  };
+  return createZip([
+    { name: `${sdkName}/README.md`, bytes: encoder.encode('# Country drums AIM SDK\n\nThis package generates new procedural performances. Included OGG layers are timbre references only and must never be replayed.') },
+    { name: `${sdkName}/manifest.json`, bytes: encoder.encode(JSON.stringify(manifest, null, 2)) },
+    { name: `${sdkName}/synth-profile.json`, bytes: encoder.encode(JSON.stringify({ architecture: 'procedural country drum kit', sourcePlayback: false }, null, 2)) },
+    { name: `${sdkName}/midi2.json`, bytes: encoder.encode(JSON.stringify(drumMidi2, null, 2)) },
+    { name: `${sdkName}/runtime-contract.json`, bytes: encoder.encode(JSON.stringify({ runtimeId: 'aim.drums.procedural.v1', input: 'MIDI 2.0 UMP note and per-note expression events', output: 'linear PCM audio', sampleRate: 44100, channels: 1, deterministic: true, sourcePlayback: false, referenceLayers: 'analysis-only' }, null, 2)) },
+    { name: `${sdkName}/drums.aim`, bytes: aimBytes },
+  ]);
 }
 
 function buildAimFile(instrument: InstrumentId, assets: Asset[], controls: Record<string, number>, performance: { seed: number; architecture: string } | null) {
@@ -510,8 +618,10 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
   const [active, setActive] = useState<InstrumentId>('acoustic-guitar');
   const [assetBank, setAssetBank] = useState<Record<InstrumentId, Asset[]>>(createAssetBank);
   const [generationLibrary, setGenerationLibrary] = useState<Partial<Record<InstrumentId, GenerationInstrument>>>({});
-  const [sampleCandidates, setSampleCandidates] = useState<Asset[]>([]);
-  const [candidateInstrument, setCandidateInstrument] = useState<InstrumentId | null>(null);
+  const [sampleCandidateBank, setSampleCandidateBank] = useState<Record<InstrumentId, Asset[]>>(createAssetBank);
+  const [scanStatus, setScanStatus] = useState<SampleScanStatus>('idle');
+  const [scanProgress, setScanProgress] = useState({ processed: 0, total: 0 });
+  const [scanSummary, setScanSummary] = useState<SampleScanSummary | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [seed, setSeed] = useState(14);
@@ -525,6 +635,13 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
   const [liveNote, setLiveNote] = useState<number | null>(null);
   const [midiStatus, setMidiStatus] = useState<'unavailable' | 'waiting' | 'connected'>('unavailable');
   const [song, setSong] = useState<SongInput>({ title: '', lyrics: '', prompt: '', tempo: 108, key: 'G major' });
+  const [drumKit, setDrumKit] = useState<DrumKitSettings>(defaultDrumKitSettings);
+  const [drumReferences, setDrumReferences] = useState<Asset[]>([]);
+  const [drumCandidates, setDrumCandidates] = useState<Asset[]>([]);
+  const [drumScanStatus, setDrumScanStatus] = useState<DrumScanStatus>('idle');
+  const [drumScanProgress, setDrumScanProgress] = useState({ processed: 0, total: 0 });
+  const [drumScanSummary, setDrumScanSummary] = useState<DrumScanSummary | null>(null);
+  const [drumScanError, setDrumScanError] = useState<string | null>(null);
   const [songError, setSongError] = useState<string | null>(null);
   const [arrangement, setArrangement] = useState<ArrangementSection[]>([]);
   const [lyricCues, setLyricCues] = useState<LyricCue[]>([]);
@@ -542,12 +659,14 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
   assetBankRef.current = assetBank;
   const fileRef = useRef<HTMLInputElement>(null);
   const folderRef = useRef<HTMLInputElement>(null);
+  const drumFolderRef = useRef<HTMLInputElement>(null);
   const aimFileRef = useRef<HTMLInputElement>(null);
   const liveEngineRef = useRef<LiveEngine | null>(null);
   const heldNotesRef = useRef(new Set<number>());
   const controlLocksRef = useRef<Record<InstrumentId, boolean>>(Object.fromEntries(order.map((instrument) => [instrument, false])) as Record<InstrumentId, boolean>);
   const profile = profiles[active];
   const assets = assetBank[active];
+  const sampleCandidates = sampleCandidateBank[active];
   const controls = controlBank[active];
   const controlMode = controlModes[active];
   const liveSettingsRef = useRef({ active, controls, seed });
@@ -573,14 +692,18 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
         fileName: item.fileName, sdkFileName: item.sdkFileName, layers: Number(item.layers), savedAt: item.updatedAt, aimObjectPath: item.aimObjectPath, sdkObjectPath: item.sdkObjectPath,
       }])) }));
       const hydrated = createAssetBank();
+      const hydratedDrums: Asset[] = [];
       await Promise.all(library.references.map(async (reference) => {
         const response = await fetch(`/api/storage${reference.objectPath}`, { credentials: 'include' });
         if (!response.ok) throw new Error(`Could not restore ${reference.metadata.name}.`);
         const bytes = new Uint8Array(await response.arrayBuffer());
-        hydrated[reference.instrumentId].push({ ...reference.metadata, objectPath: reference.objectPath, bytes, url: URL.createObjectURL(new Blob([bytes], { type: 'audio/ogg' })) });
+        const asset = { ...reference.metadata, objectPath: reference.objectPath, bytes, url: URL.createObjectURL(new Blob([bytes], { type: 'audio/ogg' })) };
+        if (reference.instrumentId === 'drums') hydratedDrums.push(asset);
+        else if (reference.instrumentId in hydrated) hydrated[reference.instrumentId as InstrumentId].push(asset);
       }));
       const nextBank = mergeAssetBanks(hydrated, assetBankRef.current);
       replaceAssetBank(nextBank);
+      setDrumReferences(hydratedDrums);
       order.forEach((instrument) => applyReferenceRecommendation(instrument, nextBank[instrument]));
     } catch (error) {
       setPersistenceError(error instanceof Error ? error.message : 'Your library could not be loaded.');
@@ -618,8 +741,11 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
       }
       const payload = {
         title: song.title.trim(),
-        song, arrangement, lyricCues, musicianMix,
-        assets: Object.fromEntries(order.map((instrument) => [instrument, savedAssets[instrument].map(({ bytes: _bytes, url: _url, score: _score, selected: _selected, ...asset }) => asset)])),
+        song, arrangement, lyricCues, musicianMix, drumKit,
+        assets: {
+          ...Object.fromEntries(order.map((instrument) => [instrument, savedAssets[instrument].map(({ bytes: _bytes, url: _url, score: _score, selected: _selected, ...asset }) => asset)])),
+          drums: drumReferences.map(({ bytes: _bytes, url: _url, score: _score, selected: _selected, ...asset }) => asset),
+        },
         renderHistory: nextHistory,
       };
       const project = await apiJson<SavedSongProject>(`/api/studio/projects/${projectId}`, { method: 'PUT', body: JSON.stringify(payload) });
@@ -646,7 +772,14 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
           return { ...asset, bytes, url: URL.createObjectURL(new Blob([bytes], { type: 'audio/ogg' })) };
         }));
       }
-      setSong(project.song); setArrangement(project.arrangement); setLyricCues(project.lyricCues); setMusicianMix(project.musicianMix); replaceAssetBank(hydrated);
+      const hydratedDrums = await Promise.all((project.assets.drums ?? []).map(async (asset) => {
+        if (!asset.objectPath) throw new Error(`A drum reference in ${project.title} is missing from storage.`);
+        const response = await fetch(`/api/storage${asset.objectPath}`, { credentials: 'include' });
+        if (!response.ok) throw new Error(`Could not reopen ${asset.name}.`);
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        return { ...asset, bytes, url: URL.createObjectURL(new Blob([bytes], { type: 'audio/ogg' })) };
+      }));
+      setSong(project.song); setDrumKit(project.drumKit ?? defaultDrumKitSettings()); setArrangement(project.arrangement); setLyricCues(project.lyricCues); setMusicianMix({ ...emptyMusicianMix(), ...project.musicianMix }); setDrumReferences(hydratedDrums); replaceAssetBank(hydrated);
       order.forEach((instrument) => applyReferenceRecommendation(instrument, hydrated[instrument]));
       const history = project.renderHistory ?? [];
       setRenderHistory(history); setProjectId(project.id);
@@ -805,52 +938,154 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
     if (!files) return;
     const selectedFiles = Array.from(files);
     if (!selectedFiles.length) {
-      setUploadError('No files were selected. Choose a folder containing OGG files and try again.');
+      setScanStatus('complete');
+      setUploadError('No files were selected. Choose the AIM folder and try again.');
       return;
     }
-    const oggFiles = selectedFiles.filter((file) => file.name.toLowerCase().endsWith('.ogg'));
-    if (!oggFiles.length) {
-      setUploadError('No .ogg files were found in that selection. AIM source layers must be OGG files.');
+
+    const scanFallback = active === 'vocal' ? null : active;
+    const discovered = discoverSampleFiles(selectedFiles, scanFallback as SampleInstrumentId);
+    const discoveredCount = sampleInstrumentOrder.reduce((total, instrument) => total + discovered.groups[instrument].length, 0);
+    setScanStatus('scanning');
+    setScanProgress({ processed: 0, total: discoveredCount });
+    setScanSummary(null);
+    setUploadError(null);
+
+    if (!discoveredCount) {
+      setScanStatus('complete');
+      setScanSummary({
+        rootName: discovered.rootName,
+        discovered: 0,
+        analyzed: 0,
+        skipped: discovered.skipped.length,
+        unreadable: 0,
+        grouped: Object.fromEntries(sampleInstrumentOrder.map((instrument) => [instrument, 0])) as Record<InstrumentId, number>,
+      });
+      setUploadError(discovered.skipped.length
+        ? 'The selected folder has no supported OGG source files in recognizable instrument folders.'
+        : 'No .ogg files were found in that selection. AIM source layers must be OGG files.');
       return;
     }
-    const analyzed: Array<Asset | null> = await Promise.all(
-      oggFiles.map(async (file): Promise<Asset | null> => {
+
+    const analyzedBank = createAssetBank();
+    let processed = 0;
+    let analyzed = 0;
+    let unreadable = 0;
+    for (const instrument of sampleInstrumentOrder) {
+      for (const item of discovered.groups[instrument]) {
         try {
-          const bytes = new Uint8Array(await file.arrayBuffer());
-          return {
-            name: file.name,
+          const bytes = new Uint8Array(await item.file.arrayBuffer());
+          analyzedBank[instrument].push({
+            name: item.file.name,
             bytes,
-            url: URL.createObjectURL(file),
-            size: formatBytes(file.size),
-            sourcePath: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
-           features: await analyzeReference(bytes),
-          };
+            url: URL.createObjectURL(item.file),
+            size: formatBytes(item.file.size),
+            sourcePath: item.sourcePath,
+            features: await analyzeReference(bytes),
+          });
+          analyzed += 1;
         } catch {
-          return null;
+          unreadable += 1;
+        } finally {
+          processed += 1;
+          setScanProgress({ processed, total: discoveredCount });
         }
-      }),
-    );
-    const next = analyzed.filter((asset): asset is Asset => asset !== null);
-    if (!next.length) {
-      setUploadError('None of the selected OGG files could be analyzed. Check that the files contain supported OGG audio and try again.');
+      }
+    }
+
+    const nextCandidateBank = createAssetBank();
+    for (const instrument of sampleInstrumentOrder) {
+      const existingCandidates = sampleCandidateBank[instrument];
+      const acceptedPaths = new Set(assetBankRef.current[instrument].map((asset) => asset.sourcePath ?? asset.name));
+      const existingPaths = new Set(existingCandidates.map((asset) => asset.sourcePath ?? asset.name));
+      const incoming = analyzedBank[instrument].filter((asset) => {
+        const path = asset.sourcePath ?? asset.name;
+        return !acceptedPaths.has(path) && !existingPaths.has(path);
+      });
+      nextCandidateBank[instrument] = rankReferenceLayers(instrument, [...existingCandidates, ...incoming]);
+    }
+    setSampleCandidateBank(nextCandidateBank);
+
+    const skipped = discovered.skipped.length + unreadable;
+    setScanSummary({
+      rootName: discovered.rootName,
+      discovered: discoveredCount,
+      analyzed,
+      skipped,
+      unreadable,
+      grouped: Object.fromEntries(sampleInstrumentOrder.map((instrument) => [instrument, analyzedBank[instrument].length])) as Record<InstrumentId, number>,
+    });
+    setScanStatus('complete');
+    setUploadError(analyzed === 0
+      ? 'None of the selected OGG files could be analyzed. Check that the files contain supported OGG audio and try again.'
+      : skipped
+        ? `${skipped} file${skipped === 1 ? '' : 's'} were skipped. The analyzed takes are ready for review.`
+        : null);
+  }
+
+  async function scanDrumFolder(files: FileList | File[] | null) {
+    if (!files) return;
+    const discovered = discoverDrumFiles(Array.from(files));
+    setDrumScanStatus('scanning');
+    setDrumScanProgress({ processed: 0, total: discovered.files.length });
+    setDrumScanSummary(null);
+    setDrumScanError(null);
+    if (!discovered.files.length) {
+      setDrumScanStatus('complete');
+      setDrumScanSummary({ rootName: discovered.rootName, discovered: 0, analyzed: 0, skipped: discovered.skipped.length, unreadable: 0 });
+      setDrumScanError(discovered.skipped.length
+        ? 'No supported OGG drum references were found. WAV and other files are skipped.'
+        : 'No .ogg files were found in that selection.');
       return;
     }
-    const rejectedCount = oggFiles.length - next.length;
-    setUploadError(rejectedCount ? `${rejectedCount} OGG file${rejectedCount === 1 ? '' : 's'} could not be analyzed and were skipped. The remaining files are ready for review.` : null);
-    setSampleCandidates((current) => {
-      if (candidateInstrument && candidateInstrument !== active) {
-        current.forEach((candidate) => URL.revokeObjectURL(candidate.url));
-        return rankReferenceLayers(active, next);
+
+    const analyzed: Asset[] = [];
+    let unreadable = 0;
+    for (const item of discovered.files) {
+      try {
+        const bytes = new Uint8Array(await item.file.arrayBuffer());
+        analyzed.push({
+          name: item.file.name,
+          bytes,
+          url: URL.createObjectURL(item.file),
+          size: formatBytes(item.file.size),
+          sourcePath: item.sourcePath,
+          features: await analyzeReference(bytes),
+        });
+      } catch {
+        unreadable += 1;
+      } finally {
+        setDrumScanProgress((current) => ({ ...current, processed: current.processed + 1 }));
       }
-      return rankReferenceLayers(active, [...current, ...next]);
-    });
-    setCandidateInstrument(active);
+    }
+    const existingPaths = new Set([...drumReferences, ...drumCandidates].map((asset) => asset.sourcePath ?? asset.name));
+    const incoming = analyzed.filter((asset) => !existingPaths.has(asset.sourcePath ?? asset.name));
+    setDrumCandidates((current) => rankDrumReferenceLayers([...current, ...incoming]));
+    const skipped = discovered.skipped.length + unreadable;
+    setDrumScanSummary({ rootName: discovered.rootName, discovered: discovered.files.length, analyzed: analyzed.length, skipped, unreadable });
+    setDrumScanStatus('complete');
+    setDrumScanError(analyzed.length === 0
+      ? 'None of the selected drum OGG files could be analyzed.'
+      : skipped
+        ? `${skipped} drum file${skipped === 1 ? '' : 's'} skipped. The analyzed references are ready for review.`
+        : null);
+  }
+
+  async function scanAllInstrumentFolders(files: FileList | File[] | null) {
+    if (!files) return;
+    await Promise.all([addFiles(files), scanDrumFolder(files)]);
   }
 
   async function collectDroppedFiles(items: DataTransferItemList) {
     const readEntry = (entry: FileSystemEntry): Promise<File[]> => {
       if (entry.isFile) {
-        return new Promise((resolve, reject) => (entry as FileSystemFileEntry).file((file) => resolve([file]), reject));
+        return new Promise((resolve, reject) => (entry as FileSystemFileEntry).file((file) => {
+          Object.defineProperty(file, 'webkitRelativePath', {
+            configurable: true,
+            value: entry.fullPath.replace(/^\//, ''),
+          });
+          resolve([file]);
+        }, reject));
       }
       const reader = (entry as FileSystemDirectoryEntry).createReader();
       return new Promise((resolve, reject) => {
@@ -892,8 +1127,11 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
       const nextBank = { ...assetBankRef.current, [active]: [...assetBankRef.current[active], ...ready] };
       replaceAssetBank(nextBank);
       applyReferenceRecommendation(active, nextBank[active], true);
-      setSampleCandidates([]);
-      setCandidateInstrument(null);
+      const chosenPaths = new Set(chosen.map((candidate) => candidate.sourcePath ?? candidate.name));
+      setSampleCandidateBank((current) => ({
+        ...current,
+        [active]: current[active].filter((candidate) => !chosenPaths.has(candidate.sourcePath ?? candidate.name)),
+      }));
       setPersistenceStatus('saved');
     } catch (error) {
       setPersistenceStatus('error');
@@ -901,8 +1139,37 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
     }
   }
 
+  async function acceptDrumCandidates() {
+    const chosen = drumCandidates.filter((candidate) => candidate.selected);
+    if (!chosen.length) return;
+    setPersistenceStatus('saving');
+    try {
+      const ready = await Promise.all(chosen.map(async ({ selected: _selected, score: _score, ...asset }) => ({
+        ...asset,
+        objectPath: await uploadPrivateBytes(asset.bytes, asset.name, 'audio/ogg'),
+      })));
+      await apiJson('/api/studio/references/drums', {
+        method: 'POST',
+        body: JSON.stringify({ layers: ready.map(({ objectPath, name, size, features, sourcePath }) => ({
+          objectPath,
+          metadata: { name, size, features, sourcePath },
+        })) }),
+      });
+      setDrumReferences((current) => [...current, ...ready]);
+      const chosenPaths = new Set(chosen.map((candidate) => candidate.sourcePath ?? candidate.name));
+      setDrumCandidates((current) => current.filter((candidate) => !chosenPaths.has(candidate.sourcePath ?? candidate.name)));
+      setPersistenceStatus('saved');
+    } catch (error) {
+      setPersistenceStatus('error');
+      setPersistenceError(error instanceof Error ? error.message : 'The selected drum references could not be stored.');
+    }
+  }
+
   function toggleCandidate(sourcePath: string) {
-    setSampleCandidates((current) => current.map((candidate) => candidate.sourcePath === sourcePath ? { ...candidate, selected: !candidate.selected } : candidate));
+    setSampleCandidateBank((current) => ({
+      ...current,
+      [active]: current[active].map((candidate) => candidate.sourcePath === sourcePath ? { ...candidate, selected: !candidate.selected } : candidate),
+    }));
   }
 
   async function inspectAim(files: FileList | null) {
@@ -986,11 +1253,11 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
     setSongError(null);
   }
 
-  function updateMusician(instrument: InstrumentId, update: Partial<MusicianMix>) {
+  function updateMusician(instrument: StudioInstrumentId, update: Partial<MusicianMix>) {
     setMusicianMix((current) => ({ ...current, [instrument]: { ...current[instrument], ...update } }));
   }
 
-  function toggleArrangementInstrument(sectionId: string, instrument: InstrumentId) {
+  function toggleArrangementInstrument(sectionId: string, instrument: StudioInstrumentId) {
     setArrangement((current) => {
       const next = current.map((section) => section.id === sectionId
         ? { ...section, musicians: section.musicians.includes(instrument) ? section.musicians.filter((id) => id !== instrument) : [...section.musicians, instrument] }
@@ -1024,7 +1291,7 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
     setRenderingSong(true);
     setSongError(null);
     try {
-      const result = await renderStudioArrangement(nextArrangement, song, musicianMix, assetBank, controlBank, seed);
+      const result = await renderStudioArrangement(nextArrangement, song, musicianMix, assetBank, controlBank, drumKit, seed);
       if (studioRender) {
         URL.revokeObjectURL(studioRender.master.url);
         Object.values(studioRender.stems).forEach((stem) => stem && URL.revokeObjectURL(stem.url));
@@ -1052,9 +1319,9 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
       lyricLrc: toLrc(lyricCues),
       midi2: {
         protocol: 'MIDI 2.0 UMP',
-        instruments: order.map((instrument) => ({ instrument, ...midi2Maps[instrument] })),
+        instruments: [...order.map((instrument) => ({ instrument, ...midi2Maps[instrument] })), { instrument: 'drums', group: 8, noteRange: [35, 59], perNoteControllers: { 'registered-controllers.1': 'swing', 'registered-controllers.2': 'fills', 'registered-controllers.3': 'kick-tightness', 'registered-controllers.4': 'hat-openness' } }],
       },
-       outputs: ['master.wav', ...order.map((instrument) => `${instrument}.wav`), 'lyrics.lrc', 'lyrics.json', ...(showCreator ? order.flatMap((instrument) => [`${instrument}.aim`, `${instrument}-sdk.zip`]) : [])],
+       outputs: ['master.wav', ...studioOrder.map((instrument) => `${instrument}.wav`), 'lyrics.lrc', 'lyrics.json', ...(showCreator ? [...order.flatMap((instrument) => [`${instrument}.aim`, `${instrument}-sdk.zip`]), 'drums.aim', 'drums-sdk.zip'] : [])],
       renderedDuration: studioRender.duration,
     };
     const name = fileSafe(song.title);
@@ -1065,13 +1332,13 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
       { name: `${name}/lyrics.json`, bytes: encoder.encode(JSON.stringify(lyricCues, null, 2)) },
       { name: `${name}/audio/master.wav`, bytes: studioRender.master.bytes },
       ...Object.entries(studioRender.stems).filter((entry): entry is [string, { url: string; bytes: Uint8Array }] => Boolean(entry[1])).map(([instrument, stem]) => ({ name: `${name}/audio/${instrument}.wav`, bytes: stem.bytes })),
-       ...(showCreator ? order.flatMap((instrument) => {
+        ...(showCreator ? [...order.flatMap((instrument) => {
         const aimBytes = buildAimFile(instrument, assetBank[instrument], controlBank[instrument], null);
         return [
           { name: `${name}/instruments/${instrument}.aim`, bytes: aimBytes },
           { name: `${name}/sdks/${instrument}-sdk.zip`, bytes: buildAimSdkPackage(instrument, aimBytes) },
         ];
-       }) : []),
+        }), { name: `${name}/instruments/drums.aim`, bytes: buildDrumAimFile(drumReferences, drumKit) }, { name: `${name}/sdks/drums-sdk.zip`, bytes: buildDrumSdkPackage(buildDrumAimFile(drumReferences, drumKit)) }] : []),
     ];
     downloadBytes(createZip(entries), `${name}.aimsong.zip`, 'application/zip');
   }
@@ -1090,6 +1357,11 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
         window.setTimeout(() => downloadBytes(sdkBytes, sdkFileName, 'application/zip'), 120);
       }, index * 240);
     });
+    window.setTimeout(() => {
+      const aimBytes = buildDrumAimFile(drumReferences, drumKit);
+      downloadAim(aimBytes, 'drums.aim');
+      window.setTimeout(() => downloadBytes(buildDrumSdkPackage(aimBytes), 'drums-sdk.zip', 'application/zip'), 120);
+    }, order.length * 240);
   }
 
   async function downloadLicensedPackages(instruments: InstrumentId[], license: 'personal' | 'commercial') {
@@ -1139,7 +1411,7 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
               <h1>{showCreator ? 'Compose an AIM instrument' : 'Create a new performance'}</h1>
             </div>
           <div className="top-actions">
-              {showCreator && <><span className="draft"><span /> Unsaved changes</span><button className="ghost-btn" onClick={validateInspected}><Gauge size={16} /> Validate</button><button className="primary-btn" onClick={exportAim}><Save size={16} /> {saved ? 'Exported .aim + SDK' : 'Export .aim + SDK'}</button></>}
+              {showCreator && <><span className="draft"><span /> Unsaved changes</span><button className="ghost-btn" onClick={validateInspected}><Gauge size={16} /> Validate</button><button className="ghost-btn" onClick={downloadInstrumentPackages}><PackageOpen size={16} /> Export all 8</button><button className="primary-btn" onClick={exportAim}><Save size={16} /> {saved ? 'Exported .aim + SDK' : 'Export .aim + SDK'}</button></>}
               <SessionControls />
           </div>
         </header>
@@ -1158,9 +1430,9 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
           <section className="song-studio">
             <div className="studio-heading">
               <div><p className="kicker">AIM SONG STUDIO</p><h2>Build the band.<br /><em>Keep the song moving.</em></h2></div>
-              <div className="studio-spec"><b>7 AIM MUSICIANS</b><span>procedural · MIDI 2.0 ready · no voice cloning</span></div>
+              <div className="studio-spec"><b>7 AIM MUSICIANS + DRUM KIT</b><span>procedural · MIDI 2.0 ready · reference-only source layers</span></div>
             </div>
-            <div className="generation-library"><div className="generation-library-head"><span className="inspector-label">MUSIC GENERATION LIBRARY</span><span>{generationReady}/7 AIM instruments ready</span></div><div className="generation-library-grid">{order.map((instrument) => { const item = generationLibrary[instrument]; const ready = Boolean(item) || (!showCreator && commerceAccess.studioActive); return <div key={instrument} className={`generation-instrument ${ready ? 'ready' : ''}`}><span className="mixer-dot" style={{ background: profiles[instrument].color }} /><b>{profiles[instrument].title}</b><small>{item ? `ready · ${item.layers} reference layers` : showCreator ? 'export this instrument to add it' : commerceAccess.studioActive ? 'included in your studio' : 'Studio subscription required'}</small></div>; })}</div></div>
+              <div className="generation-library"><div className="generation-library-head"><span className="inspector-label">MUSIC GENERATION LIBRARY</span><span>{generationReady}/7 AIM instruments + country drum kit</span></div><div className="generation-library-grid">{order.map((instrument) => { const item = generationLibrary[instrument]; const ready = Boolean(item) || (!showCreator && commerceAccess.studioActive); return <div key={instrument} className={`generation-instrument ${ready ? 'ready' : ''}`}><span className="mixer-dot" style={{ background: profiles[instrument].color }} /><b>{profiles[instrument].title}</b><small>{item ? `ready · ${item.layers} reference layers` : showCreator ? 'export this instrument to add it' : commerceAccess.studioActive ? 'included in your studio' : 'Studio subscription required'}</small></div>; })}<div className="generation-instrument ready"><span className="mixer-dot" style={{ background: '#c89454' }} /><b>Country drums</b><small>{drumReferences.length ? `${drumReferences.length} analyzed drum references` : 'procedural kit ready'}</small></div></div></div>
             {!hasStudioGenerationAccess && <div className="studio-lock"><AlertCircle size={17} /><div><b>Song rendering is locked</b><p>An active AIM Music Studio subscription is required for new generated performances. Your account and instrument licenses remain available.</p></div><button className="primary-btn" onClick={() => document.getElementById('aim-store')?.scrollIntoView({ behavior: 'smooth' })}>Choose Studio</button></div>}
             <section className="saved-library" aria-label="Saved projects and instrument packages">
               <div className="generation-library-head"><div><span className="inspector-label">YOUR LIBRARY</span><p>Private source layers are retained for analysis and packaging only; they are never served as playback samples.</p></div><button className="text-btn" onClick={() => void refreshLibrary()}><FolderOpen size={13} /> Refresh library</button></div>
@@ -1184,19 +1456,33 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
             {arrangement.length > 0 && <div className="arrangement-panel">
               <div className="arrangement-head"><div><span className="step">ARRANGEMENT</span><h3>Radio structure · {song.tempo} BPM · {song.key}</h3></div><span>{Math.ceil(arrangement.at(-1)!.start + arrangement.at(-1)!.duration)} seconds planned</span></div>
               <div className="arrangement-track">{arrangement.map((section) => <div key={section.id} className={`section-block ${section.energy}`} style={{ flex: section.duration }}><b>{section.name}</b><small>{Math.round(section.duration)}s · {section.musicians.length} players</small></div>)}</div>
-              <div className="section-editor">{arrangement.map((section) => <div className="section-editor-row" key={section.id}><b>{section.name}</b><div>{order.map((instrument) => <button key={instrument} className={section.musicians.includes(instrument) ? 'section-player on' : 'section-player'} onClick={() => toggleArrangementInstrument(section.id, instrument)}>{profiles[instrument].title.replace(' guitar', '')}</button>)}</div></div>)}</div>
+              <div className="section-editor">{arrangement.map((section) => <div className="section-editor-row" key={section.id}><b>{section.name}</b><div>{studioOrder.map((instrument) => <button key={instrument} className={section.musicians.includes(instrument) ? 'section-player on' : 'section-player'} onClick={() => toggleArrangementInstrument(section.id, instrument)}>{instrumentTitle(instrument).replace(' guitar', '')}</button>)}</div></div>)}</div>
+              <section className="country-drum-kit">
+                <input id="aim-drum-folder" ref={drumFolderRef} className="file-picker-input" type="file" accept=".ogg,audio/ogg" multiple onChange={async (event) => { const input = event.currentTarget; await scanDrumFolder(input.files); input.value = ''; }} {...({ webkitdirectory: '', directory: '' } as Record<string, string>)} />
+                <div className="country-drum-head"><div><span className="inspector-label">COUNTRY DRUM KIT · SEPARATE PROCEDURAL STEM</span><h3>Brush the verses. Lift the choruses.</h3><p>Choose your local <b>Drums</b> folder to analyze OGG timbre references. Those files tune the kit review only and are never played back.</p></div><label className="upload-btn" htmlFor="aim-drum-folder"><FolderOpen size={13} /> Scan C:\AIM…\Drums</label></div>
+                <div className="drum-controls">
+                  <label><span>Style</span><select value={drumKit.style} onChange={(event) => setDrumKit((current) => ({ ...current, style: event.target.value as DrumKitSettings['style'] }))}><option value="classic-country">Classic country</option><option value="honky-tonk">Honky-tonk</option><option value="modern-country">Modern country</option></select></label>
+                  {([{ label: 'Swing', key: 'swing' }, { label: 'Fills', key: 'fills' }, { label: 'Kick tightness', key: 'kickTightness' }, { label: 'Hat openness', key: 'hatOpenness' }] as Array<{ label: string; key: keyof Omit<DrumKitSettings, 'style'> }>).map((control) => <label key={control.key}><span>{control.label}<b>{drumKit[control.key]}%</b></span><input type="range" min="0" max="100" value={drumKit[control.key]} onChange={(event) => setDrumKit((current) => ({ ...current, [control.key]: Number(event.target.value) }))} /></label>)}
+                </div>
+                {drumScanStatus === 'scanning' && <div className="scan-status" role="status"><Waves size={14} /><span>Scanning {drumScanProgress.processed} of {drumScanProgress.total} drum OGG files…</span><b>{drumScanProgress.total ? Math.round((drumScanProgress.processed / drumScanProgress.total) * 100) : 0}%</b></div>}
+                {drumScanSummary && drumScanStatus === 'complete' && <div className="drum-scan-summary"><span><b>{drumScanSummary.rootName ?? 'Selected drums'}</b> · {drumScanSummary.analyzed} analyzed · {drumScanSummary.skipped} skipped</span><small>{drumReferences.length} saved references</small></div>}
+                {!drumReferences.length && <p className="drum-reference-note">No local drum references loaded yet. The kit will still render procedurally; choose <b>Scan C:\AIM…\Drums</b> to analyze your folder.</p>}
+                {drumScanError && <p className="song-error">{drumScanError}</p>}
+                {drumCandidates.length > 0 && <div className="drum-candidates"><div><span className="inspector-label">DRUM REFERENCE REVIEW · {drumCandidates.filter((candidate) => candidate.selected).length} OF {drumCandidates.length} SELECTED</span><p>Transient-forward kick, snare, hat, and brush takes are selected first.</p></div><div><button className="text-btn" onClick={() => setDrumCandidates((current) => current.map((candidate) => ({ ...candidate, selected: true })))}>select all</button><button className="primary-btn" onClick={() => void acceptDrumCandidates()}><CheckCircle2 size={14} /> Add selected</button></div></div>}
+              </section>
               <div className="studio-grid">
-                <div className="musician-mixer"><span className="inspector-label">MUSICIANS · EACH HAS ITS OWN AIM SYNTH + MIDI 2.0 PROFILE</span>{order.map((instrument) => {
+                <div className="musician-mixer"><span className="inspector-label">MUSICIANS · EACH HAS ITS OWN AIM SYNTH + MIDI 2.0 PROFILE</span>{studioOrder.map((instrument) => {
                   const mix = musicianMix[instrument];
-                  return <div className={`mixer-row ${mix.muted ? 'is-muted' : ''}`} key={instrument}><span className="mixer-dot" style={{ background: profiles[instrument].color }} /><b>{profiles[instrument].title}</b><label>level <input type="range" min="0" max="100" value={mix.level} onChange={(event) => updateMusician(instrument, { level: Number(event.target.value) })} /></label><label>energy <input type="range" min="0" max="100" value={mix.intensity} onChange={(event) => updateMusician(instrument, { intensity: Number(event.target.value) })} /></label><label>space <input type="range" min="0" max="100" value={mix.space} onChange={(event) => updateMusician(instrument, { space: Number(event.target.value) })} /></label><button className={mix.muted ? 'mix-toggle on' : 'mix-toggle'} onClick={() => updateMusician(instrument, { muted: !mix.muted })}>M</button><button className={mix.solo ? 'mix-toggle on' : 'mix-toggle'} onClick={() => updateMusician(instrument, { solo: !mix.solo })}>S</button></div>;
+                  return <div className={`mixer-row ${mix.muted ? 'is-muted' : ''}`} key={instrument}><span className="mixer-dot" style={{ background: instrument === 'drums' ? '#c89454' : profiles[instrument].color }} /><b>{instrumentTitle(instrument)}</b><label>level <input type="range" min="0" max="100" value={mix.level} onChange={(event) => updateMusician(instrument, { level: Number(event.target.value) })} /></label><label>energy <input type="range" min="0" max="100" value={mix.intensity} onChange={(event) => updateMusician(instrument, { intensity: Number(event.target.value) })} /></label><label>space <input type="range" min="0" max="100" value={mix.space} onChange={(event) => updateMusician(instrument, { space: Number(event.target.value) })} /></label><button className={mix.muted ? 'mix-toggle on' : 'mix-toggle'} onClick={() => updateMusician(instrument, { muted: !mix.muted })}>M</button><button className={mix.solo ? 'mix-toggle on' : 'mix-toggle'} onClick={() => updateMusician(instrument, { solo: !mix.solo })}>S</button></div>;
                 })}</div>
                 <div className="teleprompter"><span className="inspector-label">KARAOKE TELEPROMPTER · PHRASE TIMING</span>{lyricCues.length ? <div className="lyric-cues">{lyricCues.slice(0, 36).map((cue, index) => <span key={`${cue.word}-${index}`} className={cue.section.includes('Chorus') ? 'chorus-word' : ''}><i>{Math.floor(cue.start / 60)}:{String(Math.floor(cue.start % 60)).padStart(2, '0')}</i>{cue.word}</span>)}</div> : <p>Plan the arrangement to map lyrics to exact vocal entry points.</p>}</div>
               </div>
             </div>}
             {studioRender && <div className="render-results">
-              <div><span className="step">READY TO DOWNLOAD</span><h3>{song.title || 'AIM song'} · master, stems, and timing</h3><p>{studioRender.duration.toFixed(0)} second rendered preview with seven synchronized AIM performers.</p></div>
-                <div className="render-downloads"><a className="primary-btn" href={studioRender.master.url} download={`${fileSafe(song.title)}-master.wav`}><Download size={15} /> Master WAV</a><button className="ghost-btn" onClick={downloadSongProject}><FileArchive size={15} /> Download song ZIP</button>{showCreator && <button className="ghost-btn" onClick={downloadInstrumentPackages}><PackageOpen size={15} /> 7 AIM instruments + SDKs</button>}</div>
-              <div className="stem-downloads">{order.map((instrument) => studioRender.stems[instrument] && <a key={instrument} href={studioRender.stems[instrument]!.url} download={`${fileSafe(song.title)}-${instrument}.wav`}>{profiles[instrument].title} stem <Download size={12} /></a>)}</div>
+              <div><span className="step">READY TO DOWNLOAD</span><h3>{song.title || 'AIM song'} · master, stems, and timing</h3><p>{studioRender.duration.toFixed(0)} second rendered preview with seven AIM performers and a country drum stem. {drumReferences.length ? `${drumReferences.length} local drum references informed this kit.` : 'This preview uses the procedural kit without local drum references.'}</p></div>
+              <div className="render-downloads"><a className="primary-btn" href={studioRender.master.url} download={`${fileSafe(song.title)}-master.wav`}><Download size={15} /> Master WAV</a><button className="ghost-btn" onClick={downloadSongProject}><FileArchive size={15} /> Download song ZIP</button>{showCreator && <button className="ghost-btn" onClick={downloadInstrumentPackages}><PackageOpen size={15} /> 8 AIM instruments + SDKs</button>}</div>
+              <div className="render-player"><span className="inspector-label">MASTER PREVIEW</span><audio controls preload="metadata" src={studioRender.master.url}>Your browser does not support audio playback.</audio></div>
+              <div className="stem-downloads">{studioOrder.map((instrument) => studioRender.stems[instrument] && <a key={instrument} href={studioRender.stems[instrument]!.url} download={`${fileSafe(song.title)}-${instrument}.wav`}>{instrumentTitle(instrument)} stem <Download size={12} /></a>)}</div>
             </div>}
             {renderHistory.length > 1 && <div className="render-history" aria-label="Saved render history"><span className="inspector-label">SAVED RENDER HISTORY</span><div>{renderHistory.map((render, index) => <button key={render.id} className={selectedRenderId === render.id ? 'selected' : ''} onClick={() => void loadSavedRender(render)}><b>{index === 0 ? 'Latest render' : `Render ${renderHistory.length - index}`}</b><small>{new Date(render.savedAt).toLocaleString()} · {render.duration.toFixed(0)} seconds</small></button>)}</div></div>}
           </section>
@@ -1267,15 +1553,19 @@ function InstrumentLab({ showCreator, commerceAccess, onRefreshCommerce }: { sho
             </section>
 
             <section className="panel assets-panel">
-              <div className="panel-head"><div><span className="step">03</span><h3>Source layers</h3></div><div className="asset-actions"><span className="asset-count">{assets.length} attached</span><label className="upload-btn" htmlFor="aim-sample-files"><Upload size={13} /> Upload samples</label><label className="upload-btn" htmlFor="aim-sample-folder"><FolderOpen size={13} /> Add a folder</label></div></div>
-              <p className="panel-description">Add folders of OGG takes. Each folder is added to the same curation batch. Use the folder chooser repeatedly, or drag several folders together onto the drop area.</p>
+              <div className="panel-head"><div><span className="step">03</span><h3>{active === 'vocal' ? 'Lyrics-driven vocal' : 'Source layers'}</h3></div><div className="asset-actions"><span className="asset-count">{assets.length} attached</span>{active !== 'vocal' && <><label className="upload-btn" htmlFor="aim-sample-files"><Upload size={13} /> Upload samples</label><label className="upload-btn" htmlFor="aim-sample-folder"><FolderOpen size={13} /> Scan all folders</label></>}</div></div>
+              <p className="panel-description">{active === 'vocal' ? 'Vocal music is created from the lyric sheet below. No vocal reference folder is needed.' : <>Choose <b>AIM(Advannced Instrument Modeling)</b> from your C: drive. One scan groups the six playable instruments and the separate Country Drum Kit; OGG takes are embedded as analysis-only references only after review.</>}</p>
               <input id="aim-sample-files" ref={fileRef} className="file-picker-input" type="file" accept=".ogg,audio/ogg" multiple onChange={async (event) => { const input = event.currentTarget; await addFiles(input.files); input.value = ''; }} />
-              <input id="aim-sample-folder" ref={folderRef} className="file-picker-input" type="file" accept=".ogg,audio/ogg" multiple onChange={async (event) => { const input = event.currentTarget; await addFiles(input.files); input.value = ''; }} {...({ webkitdirectory: '', directory: '' } as Record<string, string>)} />
-              <label className="dropzone" htmlFor="aim-sample-folder" onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }} onDrop={async (event) => { event.preventDefault(); try { const files = event.dataTransfer.items?.length ? await collectDroppedFiles(event.dataTransfer.items) : Array.from(event.dataTransfer.files); await addFiles(files); } catch { setUploadError('Those folders could not be read. Try the Add a folder button or drop the OGG files directly.'); } }}>
-                <span className="upload-icon"><FolderOpen size={18} /></span><b>Drop multiple sample folders here</b><span>multi-folder drop supported · picker selections merge · OGG files only</span>
-              </label>
-              {uploadError && <div className="upload-error" role="alert"><AlertCircle size={14} /> {uploadError}</div>}
-              {sampleCandidates.length > 0 && candidateInstrument === active && <div className="curation-panel"><div className="curation-head"><div><span className="inspector-label">AIM SAMPLE CURATION · {sampleCandidates.filter((candidate) => candidate.selected).length} OF {sampleCandidates.length} PRESELECTED</span><p>Ranked for {profile.title} by level, tone, transient, and useful length.</p></div><div><label className="text-btn" htmlFor="aim-sample-folder"><FolderOpen size={13} /> add another folder</label><button className="text-btn" onClick={() => setSampleCandidates((current) => current.map((candidate) => ({ ...candidate, selected: true })))}>select all</button><button className="primary-btn" onClick={acceptCandidates}><CheckCircle2 size={14} /> Add selected</button></div></div><div className="candidate-list">{sampleCandidates.map((candidate) => <label className={`candidate-row ${candidate.selected ? 'chosen' : ''}`} key={`${candidate.sourcePath}-${candidate.name}`}><input type="checkbox" checked={Boolean(candidate.selected)} onChange={() => toggleCandidate(candidate.sourcePath ?? candidate.name)} /><span className="candidate-name"><b>{candidate.name}</b><small>{candidate.sourcePath}</small></span><span className="candidate-score">{candidate.score ?? 0}<small>score</small></span></label>)}</div></div>}
+              <input id="aim-sample-folder" ref={folderRef} className="file-picker-input" type="file" accept=".ogg,audio/ogg" multiple onChange={async (event) => { const input = event.currentTarget; await scanAllInstrumentFolders(input.files); input.value = ''; }} {...({ webkitdirectory: '', directory: '' } as Record<string, string>)} />
+              {active === 'vocal' ? <div className="vocal-source-note"><Mic2 size={17} /><div><b>Lyrics are the vocal source</b><span>Add lyrics in Song Studio to place the generated vocal into the arrangement and downloadable stems.</span></div></div> : <>
+                <label className="dropzone" htmlFor="aim-sample-folder" onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }} onDrop={async (event) => { event.preventDefault(); try { const files = event.dataTransfer.items?.length ? await collectDroppedFiles(event.dataTransfer.items) : Array.from(event.dataTransfer.files); await scanAllInstrumentFolders(files); } catch { setUploadError('Those folders could not be read. Try the Scan all folders button or drop the OGG files directly.'); } }}>
+                  <span className="upload-icon"><FolderOpen size={18} /></span><b>Drop the AIM folder here</b><span>recursive scan · six instruments + Country Drums · OGG files only</span>
+                </label>
+                {scanStatus === 'scanning' && <div className="scan-status" role="status" aria-live="polite"><Waves size={14} /><span>Scanning {scanProgress.processed} of {scanProgress.total} OGG takes…</span><b>{scanProgress.total ? Math.round((scanProgress.processed / scanProgress.total) * 100) : 0}%</b></div>}
+                {scanSummary && scanStatus === 'complete' && <div className="scan-summary" role="status"><div className="scan-summary-head"><div><span className="inspector-label">FOLDER SCAN COMPLETE</span><b>{scanSummary.rootName ?? 'Selected files'}</b></div><span>{scanSummary.analyzed} analyzed · {scanSummary.skipped} skipped</span></div><div className="scan-groups">{sampleInstrumentOrder.map((instrument) => <button key={instrument} className={sampleCandidateBank[instrument].length ? 'has-candidates' : ''} onClick={() => setActive(instrument)} disabled={!sampleCandidateBank[instrument].length}><span>{profiles[instrument].title}</span><b>{scanSummary.grouped[instrument]}</b><small>{sampleCandidateBank[instrument].length ? `${sampleCandidateBank[instrument].filter((candidate) => candidate.selected).length} selected` : 'no takes'}</small></button>)}</div>{scanSummary.unreadable > 0 && <small className="scan-warning">{scanSummary.unreadable} OGG file{scanSummary.unreadable === 1 ? '' : 's'} could not be analyzed and will not affect settings.</small>}</div>}
+                {uploadError && <div className="upload-error" role="alert"><AlertCircle size={14} /> {uploadError}</div>}
+                {sampleCandidates.length > 0 && <div className="curation-panel"><div className="curation-head"><div><span className="inspector-label">{profiles[active].title.toUpperCase()} CURATION · {sampleCandidates.filter((candidate) => candidate.selected).length} OF {sampleCandidates.length} PRESELECTED</span><p>Strongest takes are ranked by level, tone, transient, and useful length.</p></div><div><button className="text-btn" onClick={() => setSampleCandidateBank((current) => ({ ...current, [active]: current[active].map((candidate) => ({ ...candidate, selected: true })) }))}>select all</button><button className="primary-btn" onClick={() => void acceptCandidates()}><CheckCircle2 size={14} /> Add selected</button></div></div><div className="candidate-list">{sampleCandidates.map((candidate) => <label className={`candidate-row ${candidate.selected ? 'chosen' : ''}`} key={`${candidate.sourcePath}-${candidate.name}`}><input type="checkbox" checked={Boolean(candidate.selected)} onChange={() => toggleCandidate(candidate.sourcePath ?? candidate.name)} /><span className="candidate-name"><b>{candidate.name}</b><small>{candidate.sourcePath}</small></span><span className="candidate-score">{candidate.score ?? 0}<small>score</small></span></label>)}</div></div>}
+              </>}
               <div className="asset-list">{assets.length === 0 ? <div className="empty-assets"><span>♪</span><p>No layers yet</p><small>OGG keeps AIM packages compact and streamable.</small></div> : assets.map((asset) => <div className="asset-row" key={`${asset.name}-${asset.size}`}><span className="play"><Waves size={12} /></span><div><b>{asset.name}</b><small>analyzed · timbre {Math.round((asset.features?.brightness ?? 0) * 100)}% · fingerprint {asset.features?.fingerprint ?? 'pending'}</small></div><span className="asset-size">{asset.size}</span></div>)}</div>
               <div className="package-meta"><span>PACKAGE SIZE</span><b>{formatBytes(packageSize)}</b><span className="meta-spacer" /><span>ROLE</span><b>REFERENCE ONLY</b></div>
             </section>
@@ -1507,20 +1797,119 @@ async function generatePerformance(instrument: InstrumentId, controls: Record<st
   return { wav: encodeWav(rendered), samples: rendered.getChannelData(0).slice(), duration, architecture, seed };
 }
 
+async function generateCountryDrumPerformance(
+  arrangement: ArrangementSection[],
+  tempo: number,
+  settings: DrumKitSettings,
+  performer: MusicianMix,
+  seed: number,
+  renderDuration: number,
+) {
+  const sampleRate = 44100;
+  const offline = new OfflineAudioContext(1, Math.ceil(sampleRate * renderDuration), sampleRate);
+  const master = offline.createGain();
+  const random = seededRandom(seed * 31 + settings.fills * 17);
+  const intensity = performer.intensity / 100;
+  master.gain.value = 0.34 * (performer.level / 100);
+  master.connect(offline.destination);
+  if (performer.space > 0) {
+    const reflection = offline.createDelay(0.45);
+    const reflectionGain = offline.createGain();
+    reflection.delayTime.value = 0.035 + performer.space / 1100;
+    reflectionGain.gain.value = (performer.space / 100) * 0.14;
+    master.connect(reflection).connect(reflectionGain).connect(offline.destination);
+  }
+
+  const addKick = (start: number, velocity: number) => {
+    const osc = offline.createOscillator();
+    const gain = offline.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(132 - settings.kickTightness * 0.22, start);
+    osc.frequency.exponentialRampToValueAtTime(48, start + 0.12);
+    gain.gain.setValueAtTime(0.001, start);
+    gain.gain.linearRampToValueAtTime(velocity * 0.55, start + 0.004);
+    gain.gain.exponentialRampToValueAtTime(0.001, start + 0.28 - settings.kickTightness / 900);
+    osc.connect(gain).connect(master);
+    osc.start(start);
+    osc.stop(Math.min(renderDuration, start + 0.32));
+  };
+  const addSnare = (start: number, velocity: number) => {
+    const noise = offline.createBufferSource();
+    const buffer = offline.createBuffer(1, Math.ceil(sampleRate * 0.18), sampleRate);
+    const channel = buffer.getChannelData(0);
+    for (let index = 0; index < channel.length; index += 1) channel[index] = random() * 2 - 1;
+    noise.buffer = buffer;
+    const filter = offline.createBiquadFilter();
+    filter.type = 'highpass';
+    filter.frequency.value = 1100;
+    const gain = offline.createGain();
+    gain.gain.setValueAtTime(0.001, start);
+    gain.gain.linearRampToValueAtTime(velocity * 0.24, start + 0.003);
+    gain.gain.exponentialRampToValueAtTime(0.001, start + 0.16);
+    noise.connect(filter).connect(gain).connect(master);
+    noise.start(start);
+  };
+  const addHat = (start: number, velocity: number, open = false) => {
+    const noise = offline.createBufferSource();
+    const buffer = offline.createBuffer(1, Math.ceil(sampleRate * (open ? 0.2 : 0.055)), sampleRate);
+    const channel = buffer.getChannelData(0);
+    for (let index = 0; index < channel.length; index += 1) channel[index] = random() * 2 - 1;
+    noise.buffer = buffer;
+    const filter = offline.createBiquadFilter();
+    filter.type = 'highpass';
+    filter.frequency.value = open ? 5200 : 7200;
+    const gain = offline.createGain();
+    gain.gain.setValueAtTime(0.001, start);
+    gain.gain.linearRampToValueAtTime(velocity * (open ? 0.11 : 0.075), start + 0.002);
+    gain.gain.exponentialRampToValueAtTime(0.001, start + (open ? 0.18 : 0.045));
+    noise.connect(filter).connect(gain).connect(master);
+    noise.start(start);
+  };
+
+  const beat = 60 / tempo;
+  const eighth = beat / 2;
+  for (let step = 0, time = 0; time < renderDuration; step += 1, time += eighth) {
+    const section = arrangement.find((candidate) => time >= candidate.start && time < candidate.start + candidate.duration);
+    if (!section?.musicians.includes('drums')) continue;
+    const barStep = step % 8;
+    const energy = section.energy === 'high' ? 1.12 : section.energy === 'low' ? 0.76 : 0.96;
+    const swingOffset = barStep % 2 === 1 ? (settings.swing / 100) * eighth * 0.34 : 0;
+    const eventTime = Math.min(renderDuration - 0.01, time + swingOffset);
+    addHat(eventTime, energy * (barStep % 2 ? 0.72 : 0.86), settings.hatOpenness > 58 && barStep === 7);
+    if (barStep === 0 || barStep === 4 || (settings.style === 'modern-country' && barStep === 3 && intensity > 0.64)) {
+      addKick(eventTime, energy * (barStep === 0 ? 1 : 0.82));
+    }
+    if (barStep === 2 || barStep === 6) addSnare(eventTime, energy * (barStep === 6 ? 1 : 0.88));
+    const nearSectionEnd = time + beat >= section.start + section.duration;
+    if (nearSectionEnd && settings.fills > 48 && barStep >= 5) {
+      addSnare(eventTime, energy * (settings.fills / 100) * 0.9);
+      if (barStep === 7) addKick(eventTime, energy * 0.72);
+    }
+    if (settings.style === 'honky-tonk' && Math.floor(step / 8) % 2 === 1 && barStep === 4) addKick(eventTime, energy * 0.62);
+  }
+  const rendered = await offline.startRendering();
+  return { wav: encodeWav(rendered), samples: rendered.getChannelData(0).slice() };
+}
+
 async function renderStudioArrangement(
   arrangement: ArrangementSection[],
   song: SongInput,
   mix: Record<string, MusicianMix>,
   assetBank: Record<InstrumentId, Asset[]>,
   controlBank: ControlBank,
+  drumKit: DrumKitSettings,
   seed: number,
 ): Promise<StudioRender> {
   const plannedDuration = arrangement.at(-1) ? arrangement.at(-1)!.start + arrangement.at(-1)!.duration : 30;
   const duration = Math.max(12, Math.min(32, plannedDuration));
-  const soloed = order.filter((instrument) => mix[instrument].solo);
-  const activeInstruments = soloed.length ? soloed : order.filter((instrument) => !mix[instrument].muted);
+  const soloed = studioOrder.filter((instrument) => mix[instrument].solo);
+  const activeInstruments = soloed.length ? soloed : studioOrder.filter((instrument) => !mix[instrument].muted);
   const renderables = await Promise.all(activeInstruments.map(async (instrument, index) => {
     const performer = mix[instrument];
+    if (instrument === 'drums') {
+      const stem = await generateCountryDrumPerformance(arrangement, song.tempo, drumKit, performer, seed + (index + 1) * 161, duration);
+      return { instrument, stem, level: performer.level / 100 };
+    }
     const modelControls = controlBank[instrument] ?? defaultControlsFor(instrument);
     const controlValues = Object.fromEntries(profiles[instrument].controls.map((control) => [
       control.label,
@@ -1580,7 +1969,7 @@ async function analyzeReference(bytes: Uint8Array): Promise<LearnedFeatures> {
 type SavedPackage = Omit<GenerationInstrument, 'bytes' | 'sdkBytes' | 'savedAt'> & { instrumentId: InstrumentId; updatedAt: string; savedAt: string };
 
 type SavedReference = {
-  instrumentId: InstrumentId;
+  instrumentId: string;
   objectPath: string;
   metadata: Omit<Asset, 'bytes' | 'url' | 'objectPath' | 'score' | 'selected'>;
 };
@@ -1612,7 +2001,8 @@ type SavedSongProject = {
   arrangement: ArrangementSection[];
   lyricCues: LyricCue[];
   musicianMix: Record<string, MusicianMix>;
-  assets: Record<InstrumentId, Array<Omit<Asset, 'bytes' | 'url'>>>;
+  assets: Record<string, Array<Omit<Asset, 'bytes' | 'url'>>>;
+  drumKit?: DrumKitSettings;
   renderHistory: SavedRender[];
   updatedAt: string;
 };

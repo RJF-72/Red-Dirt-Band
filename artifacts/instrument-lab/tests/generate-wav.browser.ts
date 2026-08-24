@@ -1,16 +1,26 @@
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import test from 'node:test';
 import { chromium } from '@playwright/test';
-import type { Locator } from '@playwright/test';
+import type { Browser, BrowserContext, Locator, Page } from '@playwright/test';
 
-const baseUrl = process.env.INSTRUMENT_LAB_URL ?? 'http://127.0.0.1:23913/';
+const baseUrl = process.env.INSTRUMENT_LAB_URL
+  ?? (process.env.REPLIT_DEV_DOMAIN ? `https://${process.env.REPLIT_DEV_DOMAIN}/` : 'http://127.0.0.1:23913/');
 const launchOptions = { headless: true };
-const ownerStorageState = process.env.INSTRUMENT_LAB_OWNER_STORAGE_STATE;
+const apiServerRequire = createRequire(new URL('../../api-server/package.json', import.meta.url));
+const { createClerkClient } = apiServerRequire('@clerk/express') as {
+  createClerkClient(options: { secretKey: string }): {
+    users: { getUserList(options: { emailAddress: string[] }): Promise<{ data: Array<{ id: string }> }> };
+    signInTokens: { createSignInToken(options: { userId: string; expiresInSeconds: number }): Promise<{ url: string }> };
+  };
+};
 
 test('Generate creates a downloadable WAV in the preview', async () => {
   const browser = await chromium.launch(launchOptions);
+  let ownerPage: { context: BrowserContext; page: Page } | undefined;
   try {
-    const page = await browser.newPage();
+    ownerPage = await createOwnerPage(browser);
+    const { page } = ownerPage;
     await page.goto(baseUrl);
     const generate = page.getByRole('button', { name: 'Generate WAV performance' });
     await assertVisible(generate);
@@ -26,14 +36,17 @@ test('Generate creates a downloadable WAV in the preview', async () => {
     ]);
     assert.match(file.suggestedFilename(), /\.wav$/);
   } finally {
+    if (ownerPage) await signOutAndClose(ownerPage.context, ownerPage.page);
     await browser.close();
   }
 });
 
 test('render failures are shown and Generate does not stay stuck', async () => {
   const browser = await chromium.launch(launchOptions);
+  let ownerPage: { context: BrowserContext; page: Page } | undefined;
   try {
-    const page = await browser.newPage();
+    ownerPage = await createOwnerPage(browser);
+    const { page } = ownerPage;
     await page.addInitScript(() => {
       Object.defineProperty(window, 'OfflineAudioContext', {
         configurable: true,
@@ -46,19 +59,17 @@ test('render failures are shown and Generate does not stay stuck', async () => {
     assert.match(await page.getByRole('alert').textContent() ?? '', /OfflineAudioContext/);
     assert.equal(await page.getByRole('button', { name: 'Generate WAV performance' }).isEnabled(), true);
   } finally {
+    if (ownerPage) await signOutAndClose(ownerPage.context, ownerPage.page);
     await browser.close();
   }
 });
 
-test('manual and default control choices survive a delayed library refresh', async (t) => {
-  if (!ownerStorageState) {
-    t.skip('Set INSTRUMENT_LAB_OWNER_STORAGE_STATE to run owner-workbench browser checks.');
-    return;
-  }
+test('manual and default control choices survive a delayed library refresh', async () => {
   const browser = await chromium.launch(launchOptions);
+  let ownerPage: { context: BrowserContext; page: Page } | undefined;
   try {
-    const context = await browser.newContext({ storageState: ownerStorageState });
-    const page = await context.newPage();
+    ownerPage = await createOwnerPage(browser);
+    const { page } = ownerPage;
     await page.goto(baseUrl);
     await page.getByRole('button', { name: 'Bass guitar' }).click();
     await page.getByRole('button', { name: 'Refresh library' }).waitFor({ state: 'visible' });
@@ -79,19 +90,21 @@ test('manual and default control choices survive a delayed library refresh', asy
     assert.equal(await cabinet.inputValue(), '60');
 
     await page.getByRole('button', { name: 'Reset defaults' }).click();
-    await page.getByText('DEFAULTS').waitFor({ state: 'visible' });
+    await page.getByText('DEFAULTS', { exact: true }).waitFor({ state: 'visible' });
     assert.equal(await cabinet.inputValue(), '62');
     await page.getByRole('button', { name: 'Refresh library' }).click();
     await waitForRelease(releases);
     releases.shift()?.();
-    await page.getByText('DEFAULTS').waitFor({ state: 'visible' });
+    await page.getByText('DEFAULTS', { exact: true }).waitFor({ state: 'visible' });
     assert.equal(await cabinet.inputValue(), '62');
   } finally {
+    if (ownerPage) await signOutAndClose(ownerPage.context, ownerPage.page);
     await browser.close();
   }
 });
 
-async function assertVisible(locator: { isVisible(): Promise<boolean> }) {
+async function assertVisible(locator: Locator) {
+  await locator.waitFor({ state: 'visible', timeout: 15_000 });
   assert.equal(await locator.isVisible(), true);
 }
 
@@ -109,4 +122,51 @@ async function setRangeValue(locator: Locator, value: number) {
     element.dispatchEvent(new Event('input', { bubbles: true }));
     element.dispatchEvent(new Event('change', { bubbles: true }));
   }, value);
+}
+
+async function createOwnerPage(browser: Browser): Promise<{ context: BrowserContext; page: Page }> {
+  const secretKey = process.env.CLERK_SECRET_KEY;
+  const ownerEmail = process.env.AIM_OWNER_EMAIL;
+  if (!secretKey || !ownerEmail) {
+    throw new Error('CLERK_SECRET_KEY and AIM_OWNER_EMAIL are required for owner-workbench browser checks.');
+  }
+
+  const clerk = createClerkClient({ secretKey });
+  const owner = await clerk.users.getUserList({ emailAddress: [ownerEmail] });
+  const ownerId = owner.data[0]?.id;
+  if (!ownerId) throw new Error('The configured AIM owner does not have a Clerk development user.');
+
+  const signInToken = await clerk.signInTokens.createSignInToken({ userId: ownerId, expiresInSeconds: 60 });
+
+  const signInContext = await browser.newContext();
+  try {
+    const signInPage = await signInContext.newPage();
+    await signInPage.goto(signInToken.url, { waitUntil: 'networkidle' });
+    const sessionCookies = await signInContext.cookies();
+    if (!sessionCookies.some((cookie) => cookie.name.startsWith('__session'))) {
+      throw new Error('Clerk did not establish an owner session for the browser check.');
+    }
+
+    const context = await browser.newContext();
+    await context.addCookies(sessionCookies.map(({ name, value, expires, httpOnly, secure, sameSite }) => ({
+      name,
+      value,
+      expires,
+      httpOnly,
+      secure,
+      sameSite,
+      url: baseUrl,
+    })));
+    return { context, page: await context.newPage() };
+  } finally {
+    await signInContext.close();
+  }
+}
+
+async function signOutAndClose(context: BrowserContext, page: Page) {
+  try {
+    await page.evaluate(async () => { await window.Clerk?.signOut(); });
+  } finally {
+    await context.close();
+  }
 }

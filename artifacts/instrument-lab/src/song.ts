@@ -30,6 +30,14 @@ export type MusicianMix = {
   solo: boolean;
 };
 
+export type DrumKitSettings = {
+  style: 'classic-country' | 'honky-tonk' | 'modern-country';
+  swing: number;
+  fills: number;
+  kickTightness: number;
+  hatOpenness: number;
+};
+
 export const songInstruments = [
   'acoustic-guitar',
   'bass-guitar',
@@ -38,16 +46,21 @@ export const songInstruments = [
   'fiddle',
   'keyboard',
   'vocal',
+  'drums',
 ] as const;
 
 export function emptyMusicianMix(): Record<string, MusicianMix> {
   return Object.fromEntries(songInstruments.map((instrument, index) => [instrument, {
-    level: instrument === 'vocal' ? 84 : 62 - (index % 3) * 4,
-    space: instrument === 'bass-guitar' ? 25 : 48,
-    intensity: instrument === 'vocal' ? 72 : 58,
+    level: instrument === 'vocal' ? 84 : instrument === 'drums' ? 68 : 62 - (index % 3) * 4,
+    space: instrument === 'bass-guitar' ? 25 : instrument === 'drums' ? 32 : 48,
+    intensity: instrument === 'vocal' ? 72 : instrument === 'drums' ? 64 : 58,
     muted: false,
     solo: false,
   }]));
+}
+
+export function defaultDrumKitSettings(): DrumKitSettings {
+  return { style: 'classic-country', swing: 12, fills: 42, kickTightness: 72, hatOpenness: 28 };
 }
 
 export function validateSongInput(input: SongInput) {
@@ -64,14 +77,14 @@ export function createRadioArrangement(tempo: number): ArrangementSection[] {
   const secondsPerBar = 240 / tempo;
   const blueprint: Array<[string, number, ArrangementSection['energy'], string[]]> = [
     ['Intro', 4, 'low', ['acoustic-guitar', 'keyboard']],
-    ['Verse 1', 12, 'medium', ['acoustic-guitar', 'bass-guitar', 'keyboard', 'vocal']],
-    ['Pre-chorus', 4, 'medium', ['acoustic-guitar', 'bass-guitar', 'fiddle', 'keyboard', 'vocal']],
-    ['Chorus 1', 8, 'high', ['acoustic-guitar', 'bass-guitar', 'electric-guitar', 'pedal-steel', 'fiddle', 'keyboard', 'vocal']],
-    ['Verse 2', 12, 'medium', ['acoustic-guitar', 'bass-guitar', 'electric-guitar', 'keyboard', 'vocal']],
-    ['Chorus 2', 8, 'high', ['acoustic-guitar', 'bass-guitar', 'electric-guitar', 'pedal-steel', 'fiddle', 'keyboard', 'vocal']],
+    ['Verse 1', 12, 'medium', ['acoustic-guitar', 'bass-guitar', 'keyboard', 'vocal', 'drums']],
+    ['Pre-chorus', 4, 'medium', ['acoustic-guitar', 'bass-guitar', 'fiddle', 'keyboard', 'vocal', 'drums']],
+    ['Chorus 1', 8, 'high', ['acoustic-guitar', 'bass-guitar', 'electric-guitar', 'pedal-steel', 'fiddle', 'keyboard', 'vocal', 'drums']],
+    ['Verse 2', 12, 'medium', ['acoustic-guitar', 'bass-guitar', 'electric-guitar', 'keyboard', 'vocal', 'drums']],
+    ['Chorus 2', 8, 'high', ['acoustic-guitar', 'bass-guitar', 'electric-guitar', 'pedal-steel', 'fiddle', 'keyboard', 'vocal', 'drums']],
     ['Bridge', 8, 'medium', ['bass-guitar', 'pedal-steel', 'fiddle', 'keyboard', 'vocal']],
-    ['Final chorus', 12, 'high', ['acoustic-guitar', 'bass-guitar', 'electric-guitar', 'pedal-steel', 'fiddle', 'keyboard', 'vocal']],
-    ['Outro', 4, 'low', ['acoustic-guitar', 'pedal-steel', 'keyboard']],
+    ['Final chorus', 12, 'high', ['acoustic-guitar', 'bass-guitar', 'electric-guitar', 'pedal-steel', 'fiddle', 'keyboard', 'vocal', 'drums']],
+    ['Outro', 4, 'low', ['acoustic-guitar', 'pedal-steel', 'keyboard', 'drums']],
   ];
   let start = 0;
   return blueprint.map(([name, bars, energy, musicians], index) => {

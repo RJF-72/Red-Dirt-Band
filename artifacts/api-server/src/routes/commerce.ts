@@ -5,18 +5,18 @@ import Stripe from "stripe";
 import { commerceAccountsTable, db } from "@workspace/db";
 import { isOwner } from "./owner";
 import { getUncachableStripeClient } from "../stripeClient";
+import {
+  collectAllPages,
+  emptyCommerceAccess,
+  hasPackageAccess,
+  INSTRUMENT_IDS,
+  isActiveStudioSubscription,
+  resolveCommerceAccess,
+  subscriptionPeriodEnd,
+  type InstrumentId,
+} from "./commerce-access";
 
 const router = Router();
-const INSTRUMENT_IDS = [
-  "acoustic-guitar",
-  "bass-guitar",
-  "electric-guitar",
-  "pedal-steel",
-  "fiddle",
-  "keyboard",
-  "vocal",
-] as const;
-type InstrumentId = typeof INSTRUMENT_IDS[number];
 type ProductKind = "instrument" | "commercial-sdk" | "studio";
 
 function currentUserId(req: Request) {
@@ -72,66 +72,15 @@ async function getOwnedCustomer(userId: string) {
   return account?.stripeCustomerId ?? null;
 }
 
-function activeSubscription(subscription: Stripe.Subscription) {
-  return subscription.status === "active" || subscription.status === "trialing";
-}
-
-function subscriptionPeriodEnd(subscription: Stripe.Subscription) {
-  return Math.max(...subscription.items.data.map((item) => item.current_period_end), 0) * 1000;
-}
-
 async function accessForCustomer(customerId: string | null) {
-  if (!customerId) {
-    return {
-      studioActive: false,
-      entitlements: { instruments: [], sdks: [], commercialSdk: false },
-      subscription: null,
-    };
-  }
+  if (!customerId) return emptyCommerceAccess();
 
   const stripe = await getUncachableStripeClient();
   const [subscriptions, sessions] = await Promise.all([
-    stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 }),
-    stripe.checkout.sessions.list({ customer: customerId, status: "complete", limit: 100 }),
+    collectAllPages(stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 })),
+    collectAllPages(stripe.checkout.sessions.list({ customer: customerId, status: "complete", limit: 100 })),
   ]);
-  const studioSubscription = subscriptions.data
-    .filter(activeSubscription)
-    .find((subscription) => subscription.items.data.some((item) => item.price.metadata?.entitlement === "studio"))
-    ?? null;
-  const instruments = new Set<InstrumentId>();
-  const sdks = new Set<InstrumentId>();
-  let commercialSdk = false;
-
-  for (const session of sessions.data) {
-    if (session.payment_status !== "paid" || session.mode !== "payment") continue;
-    const entitlement = session.metadata?.entitlement;
-    if (entitlement === "instrument:all") {
-      INSTRUMENT_IDS.forEach((id) => { instruments.add(id); sdks.add(id); });
-    } else if (entitlement?.startsWith("instrument:")) {
-      const instrument = entitlement.slice("instrument:".length) as InstrumentId;
-      if (INSTRUMENT_IDS.includes(instrument)) {
-        instruments.add(instrument);
-        sdks.add(instrument);
-      }
-    } else if (entitlement === "commercial-sdk:all") {
-      commercialSdk = true;
-    }
-  }
-
-  return {
-    studioActive: Boolean(studioSubscription),
-    entitlements: {
-      instruments: [...instruments],
-      sdks: [...sdks],
-      commercialSdk,
-    },
-    subscription: studioSubscription ? {
-      id: studioSubscription.id,
-      status: studioSubscription.status,
-      cancelAtPeriodEnd: studioSubscription.cancel_at_period_end,
-      currentPeriodEnd: subscriptionPeriodEnd(studioSubscription),
-    } : null,
-  };
+  return resolveCommerceAccess(subscriptions, sessions);
 }
 
 router.get("/commerce/catalog", async (_req, res): Promise<void> => {
@@ -190,14 +139,15 @@ router.post("/commerce/package-access/:instrumentId", async (req, res): Promise<
   try {
     const access = await accessForCustomer(await getOwnedCustomer(userId));
     const license = req.body?.license;
-    const granted = license === "commercial"
-      ? access.entitlements.commercialSdk
-      : access.entitlements.instruments.includes(instrumentId);
-    if (!granted) {
+    if (license !== "personal" && license !== "commercial") {
+      res.status(400).json({ error: "Choose a personal or commercial license." });
+      return;
+    }
+    if (!hasPackageAccess(access, instrumentId, license)) {
       res.status(403).json({ error: "This AIM package is not included in your license." });
       return;
     }
-    res.json({ granted: true, instrumentId, license: license === "commercial" ? "commercial" : "personal" });
+    res.json({ granted: true, instrumentId, license });
   } catch (error) {
     req.log.error({ err: error }, "Unable to verify package download access");
     res.status(503).json({ error: "Package access could not be verified. Please try again." });
@@ -268,8 +218,8 @@ router.post("/commerce/subscription/cancel", async (req, res): Promise<void> => 
     const customerId = await getOwnedCustomer(userId);
     if (!customerId) { res.status(404).json({ error: "No Studio subscription found." }); return; }
     const stripe = await getUncachableStripeClient();
-    const subscriptions = await stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 });
-    const subscription = subscriptions.data.find((item) => activeSubscription(item) && item.items.data.some((entry) => entry.price.metadata?.entitlement === "studio"));
+    const subscriptions = await collectAllPages(stripe.subscriptions.list({ customer: customerId, status: "all", limit: 100 }));
+    const subscription = subscriptions.find((item) => isActiveStudioSubscription(item) && item.items.data.some((entry) => entry.price.metadata?.entitlement === "studio"));
     if (!subscription) { res.status(404).json({ error: "No active Studio subscription found." }); return; }
     const updated = await stripe.subscriptions.update(subscription.id, { cancel_at_period_end: true });
     res.json({

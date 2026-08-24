@@ -27,6 +27,21 @@ The metadata describes the instrument identity, host-neutral synthesis graph, en
 
 The workbench's verified re-save action downloads the original validated AIMF bytes unchanged. This preserves the exact metadata JSON (including keys unknown to the workbench) and every source-layer payload; it only changes the downloaded filename to identify the verified copy.
 
+## Malformed package handling
+
+A compatible host must reject a package before exposing its metadata or source layers when the container is incomplete or inconsistent. The Instrument Lab inspector keeps these rejection messages stable so users receive a clear recovery path:
+
+- A package shorter than the 12-byte header: `This file is too small to contain an AIMF header.`
+- A metadata length that extends beyond the package: `The metadata section is truncated. Re-export the package and try again.`
+- Metadata that is not valid UTF-8 JSON: `The AIM metadata is not valid UTF-8 JSON. Re-export the package and try again.`
+- Metadata that is not a JSON object: `The AIM metadata must be a JSON object.`
+- A missing layer record header: `Source layer N is missing its record header.`
+- A layer record whose name or payload is incomplete: `Source layer N is truncated. Re-export the package and try again.`
+- A manifest whose asset count differs from the container layer count: `The source-layer manifest does not match the container layer count.`
+- Bytes after all declared sections: `The package contains trailing bytes outside its declared metadata and source layers.`
+
+Here `N` is the one-based source-layer number. Hosts should discard the malformed package, show the applicable message, and direct the user to choose another valid `.aim` export or re-export the instrument; they must not attempt partial inspection or re-save.
+
 ## Instrument-specific synthesis
 
 AIM intentionally does not prescribe one universal synthesizer. Each instrument profile defines controls and signal behavior appropriate to its physical mechanism: string/body resonance for acoustic guitar, cabinet/sub sustain for bass, glide and swell for pedal steel, bow pressure and rosin grain for fiddle, and breath/formant behavior for vocals. This profile controls a procedural resynthesis stage, not a sample-zone mapping or neural network.

@@ -37,3 +37,17 @@ export function rankReferenceLayers<T extends CuratableLayer>(instrument: Curata
     .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
     .map((layer, index) => ({ ...layer, selected: index < maxSelected }));
 }
+
+export function rankDrumReferenceLayers<T extends CuratableLayer>(layers: T[], maxSelected = 12) {
+  return layers
+    .map((layer) => {
+      const features = layer.features;
+      if (!features) return { ...layer, score: 0 };
+      const level = 1 - Math.min(1, Math.abs(features.rms - 0.5) / 0.5);
+      const transient = features.transient;
+      const usefulLength = features.duration >= 0.04 && features.duration <= 4 ? 1 : 0.35;
+      return { ...layer, score: Math.round((level * 0.3 + transient * 0.5 + usefulLength * 0.2) * 100) };
+    })
+    .sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
+    .map((layer, index) => ({ ...layer, selected: index < maxSelected }));
+}

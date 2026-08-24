@@ -9,7 +9,7 @@
     "serve": "vite preview --config vite.config.ts --host 0.0.0.0",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test src/*.test.ts",
-    "test:browser": "tsx --test tests/generate-wav.browser.ts"
+    "test:browser": "playwright install chromium && tsx --test tests/generate-wav.browser.ts"
   },
   "devDependencies": {
     "@clerk/react": "^6.14.5",

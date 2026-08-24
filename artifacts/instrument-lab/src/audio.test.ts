@@ -52,11 +52,14 @@ test('requires procedural new-performance output and reference-only assets', () 
   }), false);
 });
 
-function createAimFixture(fileName = 'field-recording.aim') {
+function createAimFixture(
+  fileName = 'field-recording.aim',
+  assets = [{ name: 'layer.ogg', type: 'audio/ogg', role: 'timbre-reference', bytes: 7 }],
+) {
   const metadata = new TextEncoder().encode(JSON.stringify({
     format: 'AIM',
     version: 1,
-    assets: [{ name: 'layer.ogg', type: 'audio/ogg', role: 'timbre-reference', bytes: 7 }],
+    assets,
     unknownMetadata: { futureHostHint: 'keep this', values: [3, 1, 4] },
   }));
   const name = new TextEncoder().encode('layer.ogg');
@@ -75,6 +78,13 @@ function createAimFixture(fileName = 'field-recording.aim') {
   result.set(name, offset);
   result.set(payload, offset + name.length);
   return { fileName, bytes: result, payload };
+}
+
+function expectAimError(bytes: Uint8Array, message: string) {
+  assert.throws(
+    () => parseAimFile('malformed.aim', bytes),
+    (error: unknown) => error instanceof Error && error.message === message,
+  );
 }
 
 test('inspection preserves unknown metadata and arbitrary OGG payload bytes', () => {
@@ -101,4 +111,88 @@ test('verified re-save uses instrument as the fallback filename', () => {
   const inspected = parseAimFile(fixture.fileName, fixture.bytes);
 
   assert.equal(getVerifiedAimDownload(inspected).fileName, 'instrument-verified.aim');
+});
+
+test('rejects a truncated AIMF header with the recovery error contract', () => {
+  expectAimError(
+    createAimFixture().bytes.subarray(0, 11),
+    'This file is too small to contain an AIMF header.',
+  );
+});
+
+test('rejects metadata whose declared section is truncated', () => {
+  const fixture = createAimFixture();
+  const bytes = fixture.bytes.slice(0, fixture.bytes.length - 1);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  view.setUint32(6, bytes.length, true);
+
+  expectAimError(
+    bytes,
+    'The metadata section is truncated. Re-export the package and try again.',
+  );
+});
+
+test('rejects invalid metadata JSON with the recovery error contract', () => {
+  const fixture = createAimFixture();
+  const bytes = fixture.bytes.slice();
+  const metadataStart = 12;
+  bytes[metadataStart] = 0x7b;
+  bytes[metadataStart + 1] = 0x7b;
+
+  expectAimError(
+    bytes,
+    'The AIM metadata is not valid UTF-8 JSON. Re-export the package and try again.',
+  );
+});
+
+test('rejects a metadata value that is not a JSON object', () => {
+  const invalidMetadata = new TextEncoder().encode('[]');
+  const bytes = new Uint8Array(12 + invalidMetadata.length);
+  const view = new DataView(bytes.buffer);
+  bytes.set([0x41, 0x49, 0x4d, 0x46], 0);
+  view.setUint16(4, 1, true);
+  view.setUint32(6, invalidMetadata.length, true);
+  view.setUint16(10, 0, true);
+  bytes.set(invalidMetadata, 12);
+
+  expectAimError(bytes, 'The AIM metadata must be a JSON object.');
+});
+
+test('rejects a missing layer record header', () => {
+  const fixture = createAimFixture();
+  const metadataEnd = 12 + new DataView(fixture.bytes.buffer).getUint32(6, true);
+  const bytes = fixture.bytes.slice(0, metadataEnd + 5);
+
+  expectAimError(bytes, 'Source layer 1 is missing its record header.');
+});
+
+test('rejects a truncated layer payload with the recovery error contract', () => {
+  const fixture = createAimFixture();
+  const bytes = fixture.bytes.slice(0, fixture.bytes.length - 1);
+
+  expectAimError(
+    bytes,
+    'Source layer 1 is truncated. Re-export the package and try again.',
+  );
+});
+
+test('rejects a manifest and container layer-count mismatch', () => {
+  const fixture = createAimFixture('malformed.aim', []);
+
+  expectAimError(
+    fixture.bytes,
+    'The source-layer manifest does not match the container layer count.',
+  );
+});
+
+test('rejects bytes after the declared metadata and source layers', () => {
+  const fixture = createAimFixture();
+  const bytes = new Uint8Array(fixture.bytes.length + 1);
+  bytes.set(fixture.bytes);
+  bytes[bytes.length - 1] = 0xff;
+
+  expectAimError(
+    bytes,
+    'The package contains trailing bytes outside its declared metadata and source layers.',
+  );
 });
