@@ -1,0 +1,9 @@
+- [AIM generative contract](aim-generative-contract.md) — AIM sources are reference-only; compatible engines must generate new performances, not play back OGG layers.
+- [Proprietary AIM strategy](proprietary-aim-strategy.md) — keep the AIM package and runtime private while validating the product.
+- [AIM commercial access](aim-commercial-access.md) — owner-only builder; subscribers use Studio, while instruments and SDKs are separate purchases.
+- [Vite React cache](vite-react-cache.md) — refresh and pin Vite React resolution after catalog version changes.
+- [Sample import resilience](sample-import-resilience.md) — one unreadable source must not abort a folder import batch.
+- [Instrument Lab browser validation](instrument-lab-browser-validation.md) — browser checks use the preview workflow and require Chromium runtime libraries in the Replit Nix environment.
+- [Post-merge lockfile recovery](post-merge-lockfile.md) — catalog changes need a non-frozen synchronization fallback before database reconciliation.
+- [Private studio persistence](private-studio-persistence.md) — media object paths are owner-scoped capabilities, and reference layers persist separately from song drafts.
+- [Stripe Sync migrations](stripe-sync-migrations.md) — keep Stripe Sync external to the server bundle so it can find its packaged SQL migrations at runtime.

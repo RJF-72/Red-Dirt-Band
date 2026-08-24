@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Instrument Lab"
+description = "A local-first studio for preparing datasets, launching, monitoring, and sampling seven compact instrument-specific music generation models: acoustic guitar, bass guitar, electric guitar, pedal steel guitar, fiddle, keyboard, and vocals."
+version = "1.0.0"
+id = "artifacts/instrument-lab"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 23913
+
+[services.development]
+run = "pnpm --filter @workspace/instrument-lab run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/instrument-lab", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/instrument-lab/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "23913"
+BASE_PATH = "/"

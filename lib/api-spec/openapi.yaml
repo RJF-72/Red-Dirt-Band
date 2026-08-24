@@ -1,0 +1,155 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: instruments
+    description: Instrument model recipes and status
+  - name: training
+    description: Training run controls
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /instruments:
+    get:
+      operationId: listInstruments
+      tags: [instruments]
+      summary: List instrument model recipes
+      responses:
+        "200":
+          description: Instrument recipes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Instrument"
+  /training/summary:
+    get:
+      operationId: getTrainingSummary
+      tags: [training]
+      summary: Get training dashboard summary
+      responses:
+        "200":
+          description: Training summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainingSummary"
+  /training/runs:
+    get:
+      operationId: listTrainingRuns
+      tags: [training]
+      summary: List recent training runs
+      responses:
+        "200":
+          description: Recent runs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TrainingRun"
+    post:
+      operationId: createTrainingRun
+      tags: [training]
+      summary: Start a training run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TrainingRunInput"
+      responses:
+        "201":
+          description: Started run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainingRun"
+  /training/runs/{runId}/stop:
+    post:
+      operationId: stopTrainingRun
+      tags: [training]
+      summary: Stop a training run
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Stopped run
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrainingRun"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    Instrument:
+      type: object
+      required: [id, name, family, color, status, datasetMinutes, parameters, target]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        family: { type: string }
+        color: { type: string }
+        status: { type: string, enum: [ready, needs-data, training, complete] }
+        datasetMinutes: { type: number }
+        parameters: { type: string }
+        target: { type: string }
+    TrainingSummary:
+      type: object
+      required: [models, ready, training, totalHours, lastRun]
+      properties:
+        models: { type: number, multipleOf: 1 }
+        ready: { type: number, multipleOf: 1 }
+        training: { type: number, multipleOf: 1 }
+        totalHours: { type: number }
+        lastRun: { type: ["string", "null"] }
+    TrainingRun:
+      type: object
+      required: [id, instrumentId, instrumentName, status, progress, step, totalSteps, startedAt]
+      properties:
+        id: { type: string }
+        instrumentId: { type: string }
+        instrumentName: { type: string }
+        status: { type: string, enum: [queued, training, complete, stopped] }
+        progress: { type: number }
+        step: { type: number, multipleOf: 1 }
+        totalSteps: { type: number, multipleOf: 1 }
+        startedAt: { type: string }
+    TrainingRunInput:
+      type: object
+      required: [instrumentId, steps, batchSize]
+      properties:
+        instrumentId: { type: string }
+        steps: { type: number, multipleOf: 1, minimum: 100, maximum: 1000000 }
+        batchSize: { type: number, multipleOf: 1, minimum: 1, maximum: 64 }
+
